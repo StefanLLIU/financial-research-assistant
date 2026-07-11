@@ -626,7 +626,7 @@ def fetch_price_history(ticker: str) -> dict | None:
         import random
         from datetime import timedelta
         random.seed(42)
-        dates, closes = [], []
+        dates, closes, volumes = [], [], []
         price = 80.0
         day = datetime.now() - timedelta(days=365 * 5)
         end = datetime.now()
@@ -636,8 +636,9 @@ def fetch_price_history(ticker: str) -> dict | None:
                 price = max(10.0, price)
                 dates.append(day.strftime("%Y-%m-%d"))
                 closes.append(round(price, 2))
+                volumes.append(int(random.uniform(3e6, 9e6)))
             day += timedelta(days=1)
-        return {"dates": dates, "closes": closes}
+        return {"dates": dates, "closes": closes, "volumes": volumes}
 
     session = _yf_session()
     t = yf.Ticker(ticker, session=session) if session else yf.Ticker(ticker)
@@ -647,11 +648,52 @@ def fetch_price_history(ticker: str) -> dict | None:
             return None
         dates = [d.strftime("%Y-%m-%d") for d in hist.index]
         closes = [round(float(c), 2) for c in hist["Close"]]
+        volumes = [int(v) if v == v else 0 for v in hist["Volume"]] if "Volume" in hist else []
         if not dates:
             return None
-        return {"dates": dates, "closes": closes}
+        return {"dates": dates, "closes": closes, "volumes": volumes}
     except Exception:
         return None
+
+
+def moving_average(values: list, window: int) -> list:
+    """Simple moving average; None for the first (window-1) points."""
+    out = []
+    s = 0.0
+    for i, v in enumerate(values):
+        s += v
+        if i >= window:
+            s -= values[i - window]
+        out.append(round(s / window, 2) if i >= window - 1 else None)
+    return out
+
+
+# Cached benchmark history (SPY / SOXX) — same for every user, refreshed hourly.
+_BENCH_CACHE: dict = {}
+_BENCH_TTL = 3600
+
+
+def fetch_benchmark(symbol: str) -> dict | None:
+    """5y daily closes for a benchmark index ETF, cached for an hour."""
+    symbol = symbol.upper()
+    now = time.time()
+    hit = _BENCH_CACHE.get(symbol)
+    if hit and now - hit[0] < _BENCH_TTL:
+        return hit[1]
+    data = None
+    try:
+        session = _yf_session()
+        b = yf.Ticker(symbol, session=session) if session else yf.Ticker(symbol)
+        hist = b.history(period="5y")
+        if hist is not None and not hist.empty:
+            data = {
+                "dates": [d.strftime("%Y-%m-%d") for d in hist.index],
+                "closes": [round(float(c), 2) for c in hist["Close"]],
+            }
+    except Exception:
+        data = None
+    _BENCH_CACHE[symbol] = (now, data)
+    return data
 
 
 # In-memory cache for the homepage mini-cards (ticker -> (timestamp, data)).
@@ -1062,6 +1104,11 @@ PAGE_CSS = """
   .sidebar .cat-stocks{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0 12px;}
   .sidebar a.tk{display:inline-block;background:var(--chip-bg);color:var(--chip-tx);text-decoration:none;padding:4px 10px;border-radius:6px;font-size:13px;font-weight:600;transition:background .15s;}
   .sidebar a.tk:hover{background:var(--accent);color:#fff;}
+  .sidebar .cat-title{flex:1;}
+  .sidebar .cat-heat{font-size:12px;font-weight:800;margin:0 8px 0 auto;}
+  .sidebar .cat-heat.up{color:var(--up);} .sidebar .cat-heat.down{color:var(--down);}
+  .sidebar .cat-meta{font-size:11px;color:var(--muted);padding:0 2px 8px;line-height:1.7;}
+  .sidebar .cat-meta a{color:var(--chip-tx);text-decoration:none;font-weight:700;}
   @media(max-width:860px){.layout{flex-direction:column;}.sidebar{width:auto;position:static;}}
   h1{color:var(--accent);}
   input{padding:10px 14px;font-size:16px;border:1px solid var(--input-bd);border-radius:6px;width:200px;background:var(--card);color:var(--text);}
@@ -1206,6 +1253,8 @@ T = {
         "none_found": "暂无明显信号",
         "nav_overview": "概况", "nav_chart": "走势", "nav_earn": "财报",
         "nav_news": "新闻", "nav_val": "估值/评分", "nav_risk": "风险",
+        "c_vol": "成交量", "c_earn": "财报日", "c_rebased": "已归一化对比",
+        "heat_title": "🔥 板块热度", "heat_week": "周", "heat_lead": "领涨", "heat_news": "新闻活跃度",
         "err_empty": "请输入股票代码。",
         "err_fetch": "获取数据出错：",
         "err_noprice": "未找到「{t}」的价格数据，请检查代码是否正确。",
@@ -1244,6 +1293,8 @@ T = {
         "none_found": "No clear signals",
         "nav_overview": "Overview", "nav_chart": "Chart", "nav_earn": "Earnings",
         "nav_news": "News", "nav_val": "Valuation", "nav_risk": "Risks",
+        "c_vol": "Volume", "c_earn": "Earnings", "c_rebased": "rebased",
+        "heat_title": "🔥 Market Heat", "heat_week": "1W", "heat_lead": "Top", "heat_news": "News activity",
         "err_empty": "Please enter a ticker.",
         "err_fetch": "Error fetching data: ",
         "err_noprice": 'No price data found for "{t}". Check the symbol.',
@@ -1254,81 +1305,170 @@ T = {
 _CHART_TEMPLATE = """
 <script>
 (function(){
-  var dates = __DATES__, closes = __CLOSES__, prefix = __PREFIX__;
-  var gd = document.getElementById('priceChart');
+  var dates=__DATES__, closes=__CLOSES__, volumes=__VOLUMES__, ma50=__MA50__, ma200=__MA200__;
+  var earn=__EARN__, spy=__SPY__, soxx=__SOXX__, prefix=__PREFIX__, ticker=__TICKER__, L=__LABELS__;
+  var gd=document.getElementById('priceChart');
   if(!gd || !window.Plotly || !dates.length) return;
 
+  var dark = (function(){
+    var a=document.documentElement.getAttribute('data-theme');
+    if(a) return a==='dark';
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme:dark)').matches;
+  })();
+  var fg = dark ? '#cbd5e1' : '#334155';
+  var grid = dark ? 'rgba(148,163,184,0.15)' : 'rgba(100,116,139,0.12)';
   var up = closes[closes.length-1] >= closes[0];
-  var color = up ? '#16a34a' : '#dc2626';
-  var fill = up ? 'rgba(22,163,74,0.08)' : 'rgba(220,38,38,0.08)';
+  var priceColor = up ? '#22c55e' : '#ef4444';
 
-  var trace = {x:dates, y:closes, type:'scatter', mode:'lines',
-    line:{color:color, width:2}, fill:'tozeroy', fillcolor:fill,
-    hovertemplate:'%{x|%Y-%m-%d}<br>'+prefix+'%{y:,.2f}<extra></extra>'};
+  var traces = [];
+  // Price
+  traces.push({x:dates, y:closes, type:'scatter', mode:'lines', name:ticker,
+    line:{color:priceColor, width:2},
+    hovertemplate:'%{x|%Y-%m-%d}<br>'+prefix+'%{y:,.2f}<extra>'+ticker+'</extra>'});
+  // Moving averages
+  traces.push({x:dates, y:ma50, type:'scatter', mode:'lines', name:L.ma50,
+    line:{color:'#f59e0b', width:1.3}, connectgaps:false, hoverinfo:'skip'});
+  traces.push({x:dates, y:ma200, type:'scatter', mode:'lines', name:L.ma200,
+    line:{color:'#8b5cf6', width:1.3}, connectgaps:false, hoverinfo:'skip'});
+  // Volume on secondary axis
+  var volColor = dark ? 'rgba(148,163,184,0.45)' : 'rgba(100,116,139,0.4)';
+  traces.push({x:dates, y:volumes, type:'bar', name:L.vol, yaxis:'y2',
+    marker:{color:volColor}, hovertemplate:'%{y:,}<extra>'+L.vol+'</extra>'});
+  // Earnings markers (placed on the price line)
+  if(earn && earn.length){
+    var closeByDate={}; for(var i=0;i<dates.length;i++) closeByDate[dates[i]]=closes[i];
+    var ex=[], ey=[];
+    earn.forEach(function(dt){ if(closeByDate[dt]!=null){ ex.push(dt); ey.push(closeByDate[dt]); }});
+    if(ex.length) traces.push({x:ex, y:ey, type:'scatter', mode:'markers', name:L.earn,
+      marker:{symbol:'diamond', size:9, color:'#eab308', line:{color:'#fff', width:1}},
+      hovertemplate:'%{x|%Y-%m-%d}<br>'+L.earn+'<extra></extra>'});
+  }
+  // Benchmark overlays (rebased to the stock's first price), hidden until toggled
+  function rebased(b, name, color){
+    if(!b || !b.closes || !b.closes.length) return null;
+    var f = closes[0]/b.closes[0];
+    return {x:b.dates, y:b.closes.map(function(v){return v*f;}), type:'scatter', mode:'lines',
+      name:name, visible:'legendonly', line:{color:color, width:1.3, dash:'dot'},
+      hovertemplate:'%{x|%Y-%m-%d}<br>'+name+' ('+L.rebased+')<extra></extra>'};
+  }
+  var rs=rebased(spy,'SPY','#38bdf8'); if(rs) traces.push(rs);
+  var ro=rebased(soxx,'SOXX','#fb7185'); if(ro) traces.push(ro);
 
-  // default to the most recent 1 year
-  var last = dates[dates.length-1];
-  var d = new Date(last); d.setFullYear(d.getFullYear()-1);
-  var start1y = d.toISOString().slice(0,10);
+  var last=dates[dates.length-1];
+  var d=new Date(last); d.setFullYear(d.getFullYear()-1);
+  var start1y=d.toISOString().slice(0,10);
 
-  function yRange(lo, hi){
-    var loD = new Date(lo), hiD = new Date(hi), ys = [];
+  function yRange(lo,hi){
+    var loD=new Date(lo), hiD=new Date(hi), ys=[];
     for(var i=0;i<dates.length;i++){var dd=new Date(dates[i]); if(dd>=loD&&dd<=hiD) ys.push(closes[i]);}
     if(!ys.length) return null;
     var mn=Math.min.apply(null,ys), mx=Math.max.apply(null,ys);
-    var pad=(mx-mn)*0.08 || mx*0.05; return [Math.max(0,mn-pad), mx+pad];
+    var pad=(mx-mn)*0.08||mx*0.05; return [Math.max(0,mn-pad), mx+pad];
   }
 
-  var layout = {
-    autosize:true,
-    margin:{l:55,r:15,t:10,b:30},
+  var layout={
+    autosize:true, margin:{l:55,r:15,t:8,b:26}, font:{color:fg, size:11},
+    hovermode:'x unified', bargap:0.1,
+    legend:{orientation:'h', x:0, y:1.16, font:{size:11}},
     xaxis:{type:'date', range:[start1y,last], rangeslider:{visible:false},
-      rangeselector:{x:0, y:1.12, buttons:[
-        {count:1, label:'1M', step:'month', stepmode:'backward'},
-        {count:3, label:'3M', step:'month', stepmode:'backward'},
-        {count:1, label:'1Y', step:'year', stepmode:'backward'},
-        {step:'all', label:'5Y'}
-      ]}},
-    yaxis:{tickprefix:prefix, fixedrange:true},
-    plot_bgcolor:'#fff', paper_bgcolor:'#fff', showlegend:false
+      gridcolor:grid, linecolor:grid,
+      rangeselector:{x:0, y:1.32, bgcolor:'rgba(0,0,0,0)', activecolor:dark?'#334155':'#e2e8f0',
+        font:{color:fg}, buttons:[
+        {count:1,label:'1M',step:'month',stepmode:'backward'},
+        {count:3,label:'3M',step:'month',stepmode:'backward'},
+        {count:1,label:'1Y',step:'year',stepmode:'backward'},
+        {step:'all',label:'5Y'}]}},
+    yaxis:{domain:[0.24,1], tickprefix:prefix, fixedrange:true, gridcolor:grid, zeroline:false},
+    yaxis2:{domain:[0,0.18], fixedrange:true, showgrid:false, tickformat:'.2s'},
+    plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)', showlegend:true
   };
-  var yr = yRange(start1y, last); if(yr) layout.yaxis.range = yr;
+  var yr=yRange(start1y,last); if(yr) layout.yaxis.range=yr;
 
-  Plotly.newPlot(gd, [trace], layout, {responsive:true, displayModeBar:false}).then(function(){
-    // re-measure once CSS layout has settled so the chart fits its card
+  Plotly.newPlot(gd,traces,layout,{responsive:true, displayModeBar:false}).then(function(){
     Plotly.Plots.resize(gd);
     setTimeout(function(){ Plotly.Plots.resize(gd); }, 100);
   });
   window.addEventListener('resize', function(){ Plotly.Plots.resize(gd); });
 
   gd.on('plotly_relayout', function(e){
-    var lo, hi;
+    var lo,hi;
     if(e['xaxis.range[0]']){ lo=e['xaxis.range[0]']; hi=e['xaxis.range[1]']; }
     else if(e['xaxis.range']){ lo=e['xaxis.range'][0]; hi=e['xaxis.range'][1]; }
     else if(e['xaxis.autorange']){ lo=dates[0]; hi=last; }
     else return;
-    var yr2 = yRange(lo, hi);
-    if(yr2) Plotly.relayout(gd, {'yaxis.range': yr2});
+    var yr2=yRange(lo,hi); if(yr2) Plotly.relayout(gd,{'yaxis.range':yr2});
   });
 })();
 </script>
 """
 
 
+_HEAT_CACHE: dict = {}
+_HEAT_TTL = 900  # 15 minutes
+
+
+def compute_heat(lang: str = "zh") -> list:
+    """Per-sector market heat: daily % and weekly % (averaged across the top
+    few constituents) plus the day's leading stock. Cached 15 min.
+
+    News-activity per sector is not available from the free data APIs, so it is
+    reported as unavailable rather than fabricated.
+    """
+    now = time.time()
+    hit = _HEAT_CACHE.get(lang)
+    if hit and now - hit[0] < _HEAT_TTL:
+        return hit[1]
+
+    rows = []
+    for idx, (zh, en, tickers) in enumerate(STOCK_CATEGORIES):
+        if tickers == ["DEMO"]:
+            continue
+        picks = tickers[:3]
+        dailies, weeklies, best = [], [], None
+        for tk in picks:
+            m = fetch_mini(tk)
+            cp = m.get("change_pct")
+            if cp is not None:
+                dailies.append(cp)
+                if best is None or cp > best[1]:
+                    best = (tk, cp)
+            sp = m.get("spark") or []
+            if len(sp) >= 6 and sp[-6]:
+                weeklies.append((sp[-1] - sp[-6]) / sp[-6] * 100)
+        rows.append({
+            "idx": idx,
+            "name": en if lang == "en" else zh,
+            "daily": round(sum(dailies) / len(dailies), 2) if dailies else None,
+            "weekly": round(sum(weeklies) / len(weeklies), 2) if weeklies else None,
+            "leader": best[0] if best else None,
+            "leader_pct": round(best[1], 2) if best else None,
+        })
+
+    rows.sort(key=lambda r: (r["daily"] is not None, r["daily"] if r["daily"] is not None else -1e9), reverse=True)
+    _HEAT_CACHE[lang] = (now, rows)
+    return rows
+
+
 def sidebar_html(lang: str = "zh") -> str:
+    t = T[lang]
     sections = []
     for i, (zh_title, en_title, tickers) in enumerate(STOCK_CATEGORIES):
         title = en_title if lang == "en" else zh_title
         links = "".join(
             f'<a class="tk" href="/research-page?ticker={tk}&lang={lang}">{tk}</a>' for tk in tickers
         )
-        # 第一个板块默认展开
         open_attr = " open" if i == 0 else ""
         sections.append(
-            f'<details class="cat"{open_attr}><summary>{title}</summary>'
+            f'<details class="cat" data-idx="{i}"{open_attr}>'
+            f'<summary><span class="cat-title">{title}</span>'
+            f'<span class="cat-heat" data-idx="{i}">·</span></summary>'
+            f'<div class="cat-meta" data-idx="{i}"></div>'
             f'<div class="cat-stocks">{links}</div></details>'
         )
-    return f'<aside class="sidebar"><h4 style="font-size:15px">{T[lang]["sectors"]}</h4>{"".join(sections)}</aside>'
+    return (
+        f'<aside class="sidebar" id="sidebar" data-lang="{lang}">'
+        f'<h4 style="font-size:15px">{t["heat_title"]}</h4>{"".join(sections)}</aside>'
+    )
 
 
 # Runs before paint to apply saved theme (avoids a light->dark flash).
@@ -1379,6 +1519,38 @@ _APP_JS = """
       spark(se,d.spark,up);
     }).catch(function(){var pe=c.querySelector('.mini-price');if(pe)pe.textContent='N/A';});
   });
+
+  // Market heat: fill each sector's daily/weekly/leader, then rank by daily %
+  var sb=document.getElementById('sidebar');
+  if(sb){
+    var lang=sb.getAttribute('data-lang')||'zh';
+    var LB=(lang==='en')?{wk:'1W',lead:'Top',news:'News activity'}:{wk:'周',lead:'领涨',news:'新闻活跃度'};
+    fetch('/api/heat?lang='+lang).then(function(r){return r.json();}).then(function(rows){
+      var byIdx={}; rows.forEach(function(r){byIdx[r.idx]=r;});
+      document.querySelectorAll('.cat-heat').forEach(function(el){
+        var r=byIdx[el.getAttribute('data-idx')];
+        if(!r||r.daily==null){el.textContent='';return;}
+        var up=r.daily>=0; el.textContent=(up?'+':'')+r.daily.toFixed(2)+'%';
+        el.className='cat-heat '+(up?'up':'down');
+      });
+      document.querySelectorAll('.cat-meta').forEach(function(el){
+        var r=byIdx[el.getAttribute('data-idx')]; if(!r)return;
+        var parts=[];
+        if(r.weekly!=null) parts.push(LB.wk+' '+(r.weekly>=0?'+':'')+r.weekly.toFixed(1)+'%');
+        if(r.leader) parts.push(LB.lead+': <a href="/research-page?ticker='+r.leader+'&lang='+lang+'">'+r.leader+'</a> '+(r.leader_pct>=0?'+':'')+r.leader_pct.toFixed(1)+'%');
+        parts.push(LB.news+': —');
+        el.innerHTML=parts.join('<br>');
+      });
+      // reorder sectors by daily % (hottest first); data-less sectors go last
+      rows.forEach(function(r){
+        var d=sb.querySelector('details[data-idx="'+r.idx+'"]');
+        if(d) sb.appendChild(d);
+      });
+      document.querySelectorAll('#sidebar details').forEach(function(d){
+        if(byIdx[d.getAttribute('data-idx')]===undefined) sb.appendChild(d);
+      });
+    }).catch(function(){});
+  }
 
   if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}
 })();
@@ -1506,6 +1678,11 @@ def api_mini(ticker: str = ""):
     if not ticker:
         return JSONResponse({"error": "no ticker"}, status_code=400)
     return JSONResponse(fetch_mini(ticker))
+
+
+@app.get("/api/heat")
+def api_heat(lang: str = "zh"):
+    return JSONResponse(compute_heat(_norm_lang(lang)))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1741,13 +1918,45 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
     else:
         earnings_html = f'<h3 class="sec" id="earnings">{t["earnings"]}</h3><p class="meta-line">{t["no_earnings"]}</p>'
 
-    # --- Interactive Plotly price chart (1M / 3M / 1Y / 5Y) ---
+    # --- Interactive Plotly price chart: price + MA50/MA200 + volume +
+    #     earnings markers + SPY/SOXX comparison (1M / 3M / 1Y / 5Y) ---
     if history and history.get("dates"):
+        closes = history["closes"]
+        ma50 = moving_average(closes, 50)
+        ma200 = moving_average(closes, 200)
+        # Earnings dates within the chart window
+        earn_dates = []
+        if earnings:
+            span = set(history["dates"])
+            for h in earnings.get("history", []):
+                q = h.get("quarter")
+                if q and q in span:
+                    earn_dates.append(q)
+            if earnings.get("quarter") and earnings["quarter"] in span:
+                earn_dates.append(earnings["quarter"])
+        earn_dates = sorted(set(earn_dates))
+        # Benchmarks (real tickers only; cached). SOXX only for chip/semis-like names.
+        spy = None if ticker == "DEMO" else fetch_benchmark("SPY")
+        soxx = None
+        sec_l = (stock.get("sector") or "").lower()
+        if ticker != "DEMO" and ("semiconduct" in sec_l or ticker in {"NVDA", "AMD", "AVGO", "TSM", "INTC", "QCOM", "MU", "ASML"}):
+            soxx = fetch_benchmark("SOXX")
+
+        labels = {"ma50": "MA50", "ma200": "MA200", "vol": t["c_vol"],
+                  "earn": t["c_earn"], "rebased": t["c_rebased"]}
         chart_js = _CHART_TEMPLATE
         chart_js = chart_js.replace("__DATES__", json.dumps(history["dates"]))
-        chart_js = chart_js.replace("__CLOSES__", json.dumps(history["closes"]))
+        chart_js = chart_js.replace("__CLOSES__", json.dumps(closes))
+        chart_js = chart_js.replace("__VOLUMES__", json.dumps(history.get("volumes") or []))
+        chart_js = chart_js.replace("__MA50__", json.dumps(ma50))
+        chart_js = chart_js.replace("__MA200__", json.dumps(ma200))
+        chart_js = chart_js.replace("__EARN__", json.dumps(earn_dates))
+        chart_js = chart_js.replace("__SPY__", json.dumps(spy))
+        chart_js = chart_js.replace("__SOXX__", json.dumps(soxx))
         chart_js = chart_js.replace("__PREFIX__", json.dumps(cur + " "))
-        chart_html = f'<h3 class="sec" id="chart">{t["chart"]}</h3><div id="priceChart" style="width:100%;height:380px;"></div>{chart_js}'
+        chart_js = chart_js.replace("__TICKER__", json.dumps(stock["ticker"]))
+        chart_js = chart_js.replace("__LABELS__", json.dumps(labels))
+        chart_html = f'<h3 class="sec" id="chart">{t["chart"]}</h3><div id="priceChart" style="width:100%;height:440px;"></div>{chart_js}'
     else:
         chart_html = f'<h3 class="sec" id="chart">{t["chart"]}</h3><p class="meta-line">{t["no_chart"]}</p>'
 
