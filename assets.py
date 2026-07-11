@@ -125,7 +125,7 @@ PAGE_CSS = """
   .fbox ul{margin:0;padding-left:18px;} .fbox li{font-size:13px;margin-bottom:5px;color:var(--text);}
   .fbox .none{font-size:13px;color:var(--muted);}
   /* Meta line + badges */
-  .meta-line{font-size:12px;color:var(--muted);margin:2px 0 0;}
+  .meta-line{font-size:13px;color:var(--th-tx);margin:4px 0 0;font-weight:500;}
   .status-badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;margin-left:6px;vertical-align:middle;}
   .status-badge.open{background:rgba(34,197,94,.16);color:var(--up);}
   .status-badge.closed{background:var(--th-bg);color:var(--muted);}
