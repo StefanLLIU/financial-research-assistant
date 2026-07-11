@@ -87,6 +87,18 @@ _DEMO_DATA = {
     "week_52_high": 178.30,
     "week_52_low": 110.15,
     "target_mean_price": 168.00,
+    "target_median_price": 170.00,
+    "target_high_price": 195.00,
+    "target_low_price": 140.00,
+    "target_count": 28,
+    "previous_close": 140.10,
+    "day_change": 2.40,
+    "day_change_pct": 1.71,
+    "market_state": "REGULAR",
+    "pre_market_price": None,
+    "post_market_price": 143.10,
+    "data_source": "Demo data",
+    "fetched_at": "—",
     "description": (
         "Demo Corporation Inc. is a fictional technology company used to showcase "
         "the Financial Research Assistant. It develops cloud software, AI tools, "
@@ -162,6 +174,9 @@ def fetch_finnhub_meta(symbol: str) -> dict:
     quote = _finnhub_get("/quote", {"symbol": symbol})
     if quote and quote.get("c"):
         out["price"] = _safe_float(quote.get("c"))
+        out["previous_close"] = _safe_float(quote.get("pc"))
+        out["day_change"] = _safe_float(quote.get("d"))
+        out["day_change_pct"] = _safe_float(quote.get("dp"))
 
     return out
 
@@ -211,8 +226,27 @@ def fetch_stock_data(ticker: str) -> dict:
     pe_ratio = _safe_float(info.get("trailingPE"))
     week_52_high = _safe_float(info.get("fiftyTwoWeekHigh")) or fi_year_high
     week_52_low = _safe_float(info.get("fiftyTwoWeekLow")) or fi_year_low
-    target_mean_price = _safe_float(info.get("targetMeanPrice"))
     description = info.get("longBusinessSummary", "")
+
+    # Analyst price targets (mean / median / high / low / count)
+    target_mean_price = _safe_float(info.get("targetMeanPrice"))
+    target_median_price = _safe_float(info.get("targetMedianPrice"))
+    target_high_price = _safe_float(info.get("targetHighPrice"))
+    target_low_price = _safe_float(info.get("targetLowPrice"))
+    target_count = info.get("numberOfAnalystOpinions")
+    target_count = int(target_count) if isinstance(target_count, (int, float)) else None
+
+    # Daily change + market status + pre/post-market
+    previous_close = _safe_float(info.get("regularMarketPreviousClose")) or _safe_float(
+        _safe_getattr(fi, "previous_close")
+    )
+    day_change = day_change_pct = None
+    if price is not None and previous_close:
+        day_change = price - previous_close
+        day_change_pct = (day_change / previous_close) * 100
+    market_state = info.get("marketState")  # PRE / REGULAR / POST / CLOSED
+    pre_market_price = _safe_float(info.get("preMarketPrice"))
+    post_market_price = _safe_float(info.get("postMarketPrice"))
 
     raw_news = []
     try:
@@ -240,10 +274,17 @@ def fetch_stock_data(ticker: str) -> dict:
             )
         )
 
+    sources = {"Yahoo Finance"} if (price is not None or company) else set()
+
     # Fill any gaps Yahoo left (common when its quoteSummary API is rate-limited
     # on shared cloud IPs) using Finnhub, if an API key is configured.
-    if FINNHUB_KEY and (company is None or pe_ratio is None or sector is None or price is None):
+    if FINNHUB_KEY and (
+        company is None or pe_ratio is None or sector is None or price is None
+        or day_change is None or previous_close is None
+    ):
         fh = fetch_finnhub_meta(symbol)
+        if fh:
+            sources.add("Finnhub")
         company = company or fh.get("company")
         sector = sector or fh.get("sector")
         currency = currency or fh.get("currency") or "USD"
@@ -254,6 +295,12 @@ def fetch_stock_data(ticker: str) -> dict:
         week_52_low = week_52_low or fh.get("week_52_low")
         if price is None:
             price = fh.get("price")
+        if previous_close is None:
+            previous_close = fh.get("previous_close")
+        if day_change is None:
+            day_change = fh.get("day_change")
+        if day_change_pct is None:
+            day_change_pct = fh.get("day_change_pct")
 
     return {
         "ticker": symbol,
@@ -266,8 +313,20 @@ def fetch_stock_data(ticker: str) -> dict:
         "week_52_high": week_52_high,
         "week_52_low": week_52_low,
         "target_mean_price": target_mean_price,
+        "target_median_price": target_median_price,
+        "target_high_price": target_high_price,
+        "target_low_price": target_low_price,
+        "target_count": target_count,
+        "previous_close": previous_close,
+        "day_change": day_change,
+        "day_change_pct": day_change_pct,
+        "market_state": market_state,
+        "pre_market_price": pre_market_price,
+        "post_market_price": post_market_price,
         "description": description,
         "news": news_items,
+        "data_source": " / ".join(sorted(sources)) if sources else "—",
+        "fetched_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
     }
 
 
@@ -325,96 +384,148 @@ def news_sentiment(news: list) -> int:
     return 0
 
 
-def compute_score(stock: dict, lang: str = "zh") -> dict:
-    """Composite 1-10 score from price position, P/E, analyst upside, news.
+def _css_for(score) -> str:
+    if score is None:
+        return "na"
+    if score >= 7:
+        return "bullish"
+    if score >= 4:
+        return "neutral"
+    return "bearish"
 
-    Each factor contributes points; the total is mapped to a 1-10 scale and a
-    Bullish / Neutral / Bearish label. Missing factors are simply skipped.
+
+def compute_score_breakdown(stock: dict, earnings: dict | None, lang: str = "zh") -> dict:
+    """Transparent 1-10 score built from five explained categories.
+
+    Categories: earnings growth, revenue growth, valuation, price momentum,
+    news sentiment. Each returns a 0-10 sub-score plus a plain-language
+    explanation, or None ("Data unavailable") when the inputs are missing —
+    values are never fabricated.
     """
     en = lang == "en"
-    price = stock["price"]
-    high52 = stock["week_52_high"]
-    low52 = stock["week_52_low"]
-    pe = stock["pe_ratio"]
-    upside = compute_upside(price, stock.get("target_mean_price"))
-    sentiment = news_sentiment(stock.get("news", []))
+    price = stock.get("price")
+    high52 = stock.get("week_52_high")
+    low52 = stock.get("week_52_low")
+    pe = stock.get("pe_ratio")
+    cats = []
 
-    points = 0.0       # accumulated signal, roughly -1..+1 per factor
-    factors = 0
-    reasons: list[str] = []
+    def add(key, name_zh, name_en, score, exp_zh, exp_en):
+        cats.append({
+            "key": key,
+            "name": name_en if en else name_zh,
+            "score": score,
+            "css": _css_for(score),
+            "explain": exp_en if en else exp_zh,
+        })
 
-    # 1. Price vs 52-week range — lower in range scores higher (more upside room)
-    if price and high52 and low52 and high52 > low52:
-        pos = (price - low52) / (high52 - low52)  # 0 = at low, 1 = at high
-        contrib = 1 - 2 * pos                       # +1 at low, -1 at high
-        points += contrib
-        factors += 1
-        if pos >= 0.8:
-            reasons.append("near 52-week high (limited upside)" if en else "股价接近52周高点（上涨空间有限）")
-        elif pos <= 0.3:
-            reasons.append("near 52-week low (value potential)" if en else "股价接近52周低点（具备价值潜力）")
+    na_zh, na_en = "数据暂缺", "Data unavailable"
+
+    # 1. Earnings growth — EPS trend across the available reported quarters
+    hist = (earnings or {}).get("history") or []
+    eps_series = [h["eps_actual"] for h in hist if h.get("eps_actual") is not None]
+    if len(eps_series) >= 2 and eps_series[0] not in (0, None):
+        chg = (eps_series[-1] - eps_series[0]) / abs(eps_series[0]) * 100
+        if chg >= 25:
+            sc, z, e = 9, f"EPS 稳步增长（近几季 +{chg:.0f}%）", f"EPS growing steadily (+{chg:.0f}% over recent quarters)"
+        elif chg >= 5:
+            sc, z, e = 7, f"EPS 温和增长（+{chg:.0f}%）", f"EPS growing modestly (+{chg:.0f}%)"
+        elif chg > -5:
+            sc, z, e = 5, "EPS 基本持平", "EPS roughly flat"
+        elif chg > -25:
+            sc, z, e = 3, f"EPS 下滑（{chg:.0f}%）", f"EPS declining ({chg:.0f}%)"
         else:
-            reasons.append("mid-range price position" if en else "股价处于区间中段")
+            sc, z, e = 2, f"EPS 明显下滑（{chg:.0f}%）", f"EPS falling sharply ({chg:.0f}%)"
+        add("earnings", "盈利增长", "Earnings Growth", sc, z, e)
+    else:
+        add("earnings", "盈利增长", "Earnings Growth", None, na_zh, na_en)
 
-    # 2. P/E ratio — moderate P/E is good, very high or negative is bad
+    # 2. Revenue growth — reported YoY revenue change
+    ryoy = (earnings or {}).get("revenue_yoy")
+    if ryoy is not None:
+        if ryoy >= 20:
+            sc, z, e = 9, f"营收同比强劲增长 +{ryoy:.0f}%", f"Revenue up a strong +{ryoy:.0f}% YoY"
+        elif ryoy >= 8:
+            sc, z, e = 7, f"营收同比增长 +{ryoy:.0f}%", f"Revenue up +{ryoy:.0f}% YoY"
+        elif ryoy > 0:
+            sc, z, e = 6, f"营收小幅增长 +{ryoy:.0f}%", f"Revenue up slightly +{ryoy:.0f}% YoY"
+        elif ryoy > -10:
+            sc, z, e = 4, f"营收同比下降 {ryoy:.0f}%", f"Revenue down {ryoy:.0f}% YoY"
+        else:
+            sc, z, e = 2, f"营收明显下滑 {ryoy:.0f}%", f"Revenue down sharply {ryoy:.0f}% YoY"
+        add("revenue", "营收增长", "Revenue Growth", sc, z, e)
+    else:
+        add("revenue", "营收增长", "Revenue Growth", None, na_zh, na_en)
+
+    # 3. Valuation — trailing P/E
     if pe is not None:
         if pe < 0:
-            contrib = -1.0
-            reasons.append("currently unprofitable" if en else "公司目前亏损")
+            sc, z, e = 2, "公司目前亏损（市盈率为负）", "Currently unprofitable (negative P/E)"
         elif pe < 15:
-            contrib = 0.8
-            reasons.append("attractive low P/E" if en else "市盈率偏低，估值吸引")
+            sc, z, e = 8, f"市盈率偏低 {pe:.1f}，估值有吸引力", f"Low P/E of {pe:.1f} — attractively valued"
         elif pe < 25:
-            contrib = 0.4
-            reasons.append("reasonable P/E" if en else "市盈率合理")
+            sc, z, e = 6, f"市盈率 {pe:.1f} 合理", f"Reasonable P/E of {pe:.1f}"
         elif pe < 40:
-            contrib = -0.2
-            reasons.append("elevated P/E" if en else "市盈率偏高")
+            sc, z, e = 4, f"市盈率偏高 {pe:.1f}", f"Elevated P/E of {pe:.1f}"
         else:
-            contrib = -0.8
-            reasons.append("very high P/E" if en else "市盈率非常高")
-        points += contrib
-        factors += 1
+            sc, z, e = 2, f"市盈率很高 {pe:.1f}，已计入高增长预期", f"Very high P/E of {pe:.1f} — priced for growth"
+        add("valuation", "估值", "Valuation", sc, z, e)
+    else:
+        add("valuation", "估值", "Valuation", None, na_zh, na_en)
 
-    # 3. Analyst target upside
-    if upside is not None:
-        contrib = max(-1.0, min(1.0, upside / 25))  # +/-25% => full +/-1
-        points += contrib
-        factors += 1
-        if upside >= 10:
-            reasons.append(f"analysts see {upside:.0f}% upside" if en else f"分析师预期上涨 {upside:.0f}%")
-        elif upside <= -10:
-            reasons.append(f"analysts see {abs(upside):.0f}% downside" if en else f"分析师预期下跌 {abs(upside):.0f}%")
+    # 4. Price momentum — position within the 52-week range
+    if price and high52 and low52 and high52 > low52:
+        pos = (price - low52) / (high52 - low52)
+        pct = pos * 100
+        if pos >= 0.8:
+            sc, z, e = 8, f"接近52周高点（区间 {pct:.0f}%），动能强", f"Near 52-week high ({pct:.0f}% of range) — strong momentum"
+        elif pos >= 0.6:
+            sc, z, e = 7, f"处于区间上半部（{pct:.0f}%）", f"In the upper half of its range ({pct:.0f}%)"
+        elif pos >= 0.4:
+            sc, z, e = 5, f"处于区间中段（{pct:.0f}%）", f"Mid-range ({pct:.0f}%)"
+        elif pos >= 0.2:
+            sc, z, e = 3, f"处于区间下半部（{pct:.0f}%）", f"In the lower half of its range ({pct:.0f}%)"
         else:
-            reasons.append("price near analyst target" if en else "股价接近分析师目标价")
+            sc, z, e = 2, f"接近52周低点（{pct:.0f}%），动能弱", f"Near 52-week low ({pct:.0f}%) — weak momentum"
+        add("momentum", "价格动能", "Price Momentum", sc, z, e)
+    else:
+        add("momentum", "价格动能", "Price Momentum", None, na_zh, na_en)
 
-    # 4. News sentiment
-    if stock.get("news"):
-        points += sentiment
-        factors += 1
-        if en:
-            reasons.append({1: "positive news flow", 0: "neutral news", -1: "negative news flow"}[sentiment])
+    # 5. News sentiment — keyword scan of recent headlines
+    news = stock.get("news") or []
+    if news:
+        s = news_sentiment(news)
+        if s > 0:
+            sc, z, e = 7, "近期新闻整体偏正面", "Recent news skews positive"
+        elif s < 0:
+            sc, z, e = 3, "近期新闻整体偏负面", "Recent news skews negative"
         else:
-            reasons.append({1: "近期新闻偏正面", 0: "近期新闻中性", -1: "近期新闻偏负面"}[sentiment])
+            sc, z, e = 5, "近期新闻中性/喜忧参半", "Recent news is neutral / mixed"
+        add("news", "新闻情绪", "News Sentiment", sc, z, e)
+    else:
+        add("news", "新闻情绪", "News Sentiment", None, na_zh, na_en)
 
-    # Map average signal (-1..+1) to a 1-10 scale (5.5 = neutral midpoint)
-    avg = (points / factors) if factors else 0.0
-    score = round(5.5 + avg * 4.5)
-    score = max(1, min(10, score))
+    # Overall = average of the available sub-scores
+    available = [c["score"] for c in cats if c["score"] is not None]
+    if available:
+        overall = max(1, min(10, round(sum(available) / len(available))))
+    else:
+        overall = None
 
-    if score >= 7:
+    if overall is None:
+        label, css = ("Data unavailable" if en else "数据暂缺"), "na"
+    elif overall >= 7:
         label, css = ("Bullish" if en else "看涨"), "bullish"
-    elif score >= 4:
+    elif overall >= 4:
         label, css = ("Neutral" if en else "中性"), "neutral"
     else:
         label, css = ("Bearish" if en else "看跌"), "bearish"
 
     return {
-        "score": score,
+        "score": overall,
         "label": label,
         "css": css,
-        "upside": upside,
-        "reasons": reasons,
+        "upside": compute_upside(price, stock.get("target_mean_price")),
+        "categories": cats,
     }
 
 
@@ -832,6 +943,82 @@ def generate_summary(stock: dict, lang: str = "zh") -> str:
     return "\n\n".join(paragraphs)
 
 
+def generate_structured_summary(stock: dict, earnings: dict | None, lang: str = "zh") -> dict:
+    """Structured bilingual summary: overview + bullish / risk / monitor lists.
+
+    Every point is derived from a real data value; nothing is invented. Lists
+    can be empty, in which case the UI shows a 'Data unavailable' note.
+    """
+    en = lang == "en"
+    ticker = stock["ticker"]
+    company = stock.get("company") or ticker
+    sector = stock.get("sector") or ("Unknown" if en else "未知")
+    price = stock.get("price")
+    currency = stock.get("currency") or "USD"
+    market_cap = stock.get("market_cap")
+    pe = stock.get("pe_ratio")
+    high52 = stock.get("week_52_high")
+    low52 = stock.get("week_52_low")
+    desc = stock.get("description") or ""
+    upside = compute_upside(price, stock.get("target_mean_price"))
+    ryoy = (earnings or {}).get("revenue_yoy")
+    e = earnings or {}
+
+    if desc:
+        overview = desc[:360].rstrip()
+        if not overview.endswith("."):
+            overview = overview.rsplit(" ", 1)[0] + "…"
+    else:
+        overview = (f"{company} ({ticker}) operates in the {sector} sector."
+                    if en else f"{company}（{ticker}）属于 {sector} 行业。")
+
+    bullish, risks, monitor = [], [], []
+
+    # Bullish factors
+    if ryoy is not None and ryoy > 8:
+        bullish.append(f"Revenue grew +{ryoy:.0f}% YoY" if en else f"营收同比增长 +{ryoy:.0f}%")
+    if e.get("eps_beat_pct") is not None and e["eps_beat_pct"] >= 0:
+        bullish.append(f"Latest EPS beat estimates by {e['eps_beat_pct']:.1f}%" if en else f"最新季度 EPS 超预期 {e['eps_beat_pct']:.1f}%")
+    if pe is not None and 0 < pe < 20:
+        bullish.append(f"Modest valuation (P/E {pe:.1f})" if en else f"估值不高（市盈率 {pe:.1f}）")
+    if upside is not None and upside >= 8:
+        bullish.append(f"Analysts see ~{upside:.0f}% upside to target" if en else f"分析师目标价隐含约 {upside:.0f}% 上涨空间")
+    if price and low52 and price <= 1.15 * low52:
+        bullish.append("Trading near its 52-week low (possible value)" if en else "股价接近52周低点（或有价值机会）")
+    if market_cap and market_cap >= 50e9:
+        bullish.append("Large, established company with broad coverage" if en else "大市值、业务成熟、机构覆盖充分")
+
+    # Risk factors
+    if pe is not None and pe < 0:
+        risks.append("Company is currently unprofitable" if en else "公司目前处于亏损状态")
+    elif pe is not None and pe > 40:
+        risks.append(f"Rich valuation (P/E {pe:.1f}) leaves little margin for error" if en else f"估值偏高（市盈率 {pe:.1f}），容错空间小")
+    if ryoy is not None and ryoy < 0:
+        risks.append(f"Revenue declined {ryoy:.0f}% YoY" if en else f"营收同比下降 {ryoy:.0f}%")
+    if price and high52 and price >= 0.95 * high52:
+        risks.append("Near 52-week high — vulnerable to pullbacks" if en else "接近52周高点，回调风险较大")
+    if upside is not None and upside <= -5:
+        risks.append(f"Price is ~{abs(upside):.0f}% above the average analyst target" if en else f"股价高出分析师平均目标价约 {abs(upside):.0f}%")
+    if market_cap and market_cap < 2e9:
+        risks.append("Small-cap — higher volatility and liquidity risk" if en else "小盘股，波动与流动性风险较高")
+    if news_sentiment(stock.get("news") or []) < 0:
+        risks.append("Recent headlines skew negative" if en else "近期新闻偏负面")
+
+    # Items to monitor
+    if e.get("quarter"):
+        monitor.append(f"Next earnings report (last: {e['quarter']})" if en else f"下一份财报（上次：{e['quarter']}）")
+    if stock.get("target_mean_price") and price:
+        monitor.append("Gap between price and analyst target" if en else "股价与分析师目标价之间的差距")
+    if pe is not None:
+        monitor.append("Any change in valuation multiple" if en else "估值倍数的变化")
+    if stock.get("news"):
+        monitor.append("How the recent news develops" if en else "近期新闻的后续进展")
+    if not monitor:
+        monitor.append("New disclosures as data becomes available" if en else "后续披露的新数据")
+
+    return {"overview": overview, "bullish": bullish, "risks": risks, "monitor": monitor}
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -933,6 +1120,35 @@ PAGE_CSS = """
   .spinner{width:46px;height:46px;border:4px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;}
   @keyframes spin{to{transform:rotate(360deg);}}
   .loading-text{margin-top:16px;color:var(--accent);font-weight:600;font-size:15px;}
+  /* Sticky section nav */
+  .secnav{position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:6px;padding:10px 0;margin:-8px 0 4px;background:var(--card);border-bottom:1px solid var(--border);}
+  .secnav a{text-decoration:none;color:var(--muted);font-size:13px;font-weight:600;padding:5px 10px;border-radius:6px;}
+  .secnav a:hover{background:var(--chip-bg);color:var(--chip-tx);}
+  .sec{scroll-margin-top:52px;}
+  /* Score breakdown */
+  .breakdown{display:flex;flex-direction:column;gap:10px;margin:10px 0 4px;}
+  .bd-row{display:grid;grid-template-columns:96px 46px 1fr;gap:10px;align-items:center;}
+  .bd-name{font-size:13px;font-weight:600;color:var(--text);}
+  .bd-score{font-size:15px;font-weight:800;text-align:center;border-radius:6px;padding:2px 0;}
+  .bd-score.bullish{background:rgba(34,197,94,.16);color:var(--up);}
+  .bd-score.neutral{background:rgba(148,163,184,.18);color:var(--muted);}
+  .bd-score.bearish{background:rgba(239,68,68,.16);color:var(--down);}
+  .bd-score.na{background:var(--th-bg);color:var(--muted);font-size:11px;font-weight:600;}
+  .bd-exp{font-size:13px;color:var(--muted);}
+  /* Factor lists */
+  .factors{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:8px 0;}
+  .fbox{background:var(--tile);border:1px solid var(--border);border-radius:12px;padding:14px 16px;}
+  .fbox h4{margin:0 0 8px;font-size:14px;}
+  .fbox.bull h4{color:var(--up);} .fbox.risk h4{color:var(--down);} .fbox.mon h4{color:var(--accent);}
+  .fbox ul{margin:0;padding-left:18px;} .fbox li{font-size:13px;margin-bottom:5px;color:var(--text);}
+  .fbox .none{font-size:13px;color:var(--muted);}
+  /* Meta line + badges */
+  .meta-line{font-size:12px;color:var(--muted);margin:2px 0 0;}
+  .status-badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;margin-left:6px;vertical-align:middle;}
+  .status-badge.open{background:rgba(34,197,94,.16);color:var(--up);}
+  .status-badge.closed{background:var(--th-bg);color:var(--muted);}
+  .status-badge.ext{background:rgba(59,130,246,.16);color:var(--link);}
+  .change-chip{font-size:14px;font-weight:700;margin-top:3px;}
 </style>
 """
 
@@ -976,6 +1192,20 @@ T = {
         "summary": "📋 投资摘要", "saved": "报告已保存 — 编号",
         "loading": "分析中，请稍候…",
         "featured": "🔥 热门股票", "theme_label": "深色/浅色",
+        "data_unavailable": "数据暂缺",
+        "source": "数据来源", "updated": "更新时间",
+        "day_change": "当日涨跌",
+        "mkt_regular": "交易中", "mkt_pre": "盘前", "mkt_post": "盘后", "mkt_closed": "已收盘",
+        "premarket": "盘前价", "afterhours": "盘后价",
+        "score_breakdown": "📊 评分明细", "overall_score": "综合评分",
+        "target_title": "🎯 分析师目标价",
+        "t_mean": "平均", "t_median": "中位数", "t_high": "最高", "t_low": "最低",
+        "t_count": "分析师数量", "t_upside": "上涨/下跌空间",
+        "overview": "📄 公司概况",
+        "bullish_f": "✅ 利多因素", "risk_f": "⚠️ 风险因素", "monitor_f": "🔍 需关注",
+        "none_found": "暂无明显信号",
+        "nav_overview": "概况", "nav_chart": "走势", "nav_earn": "财报",
+        "nav_news": "新闻", "nav_val": "估值/评分", "nav_risk": "风险",
         "err_empty": "请输入股票代码。",
         "err_fetch": "获取数据出错：",
         "err_noprice": "未找到「{t}」的价格数据，请检查代码是否正确。",
@@ -1000,6 +1230,20 @@ T = {
         "summary": "📋 Investment Summary", "saved": "Report saved — ID",
         "loading": "Analyzing, please wait…",
         "featured": "🔥 Trending", "theme_label": "Dark/Light",
+        "data_unavailable": "Data unavailable",
+        "source": "Source", "updated": "Updated",
+        "day_change": "Day Change",
+        "mkt_regular": "Open", "mkt_pre": "Pre-market", "mkt_post": "After-hours", "mkt_closed": "Closed",
+        "premarket": "Pre-market", "afterhours": "After-hours",
+        "score_breakdown": "📊 Score Breakdown", "overall_score": "Overall Score",
+        "target_title": "🎯 Analyst Price Target",
+        "t_mean": "Mean", "t_median": "Median", "t_high": "High", "t_low": "Low",
+        "t_count": "Analysts", "t_upside": "Upside/Downside",
+        "overview": "📄 Company Overview",
+        "bullish_f": "✅ Bullish Factors", "risk_f": "⚠️ Risk Factors", "monitor_f": "🔍 To Monitor",
+        "none_found": "No clear signals",
+        "nav_overview": "Overview", "nav_chart": "Chart", "nav_earn": "Earnings",
+        "nav_news": "News", "nav_val": "Valuation", "nav_risk": "Risks",
         "err_empty": "Please enter a ticker.",
         "err_fetch": "Error fetching data: ",
         "err_noprice": 'No price data found for "{t}". Check the symbol.',
@@ -1302,62 +1546,132 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
     # --- Price history for the chart ---
     history = fetch_price_history(ticker)
 
-    summary = generate_summary(stock, lang)
-    scoring = compute_score(stock, lang)
+    summary = generate_summary(stock, lang)  # text version, persisted to DB
+    scoring = compute_score_breakdown(stock, earnings, lang)
+    ssum = generate_structured_summary(stock, earnings, lang)
     news_json = json.dumps([n.model_dump() for n in stock["news"]])
     report_data = {**stock, "ai_summary": summary, "news_json": news_json}
-    report_data.pop("news", None)
-    report_data.pop("description", None)
+    for k in ("news", "description", "target_median_price", "target_high_price",
+              "target_low_price", "target_count", "previous_close", "day_change",
+              "day_change_pct", "market_state", "pre_market_price", "post_market_price",
+              "data_source", "fetched_at"):
+        report_data.pop(k, None)
     report_id = db.save_report(report_data)
 
     cur = stock["currency"] or "USD"
-    num = lambda v: "N/A" if v is None else f"{v:,.2f}"
+    dua = t["data_unavailable"]
+    num = lambda v: dua if v is None else f"{v:,.2f}"
+    money = lambda v: dua if v is None else f"{cur} {v:,.2f}"
     news_html = "".join(
         f'<li><a href="{n.link}" target="_blank">{n.title}</a><br><small>{n.publisher} — {n.published}</small></li>'
         for n in stock["news"]
     ) or f"<li>{t['no_news']}</li>"
 
-    summary_html = summary.replace("**", "<strong>", 1)
-    while "**" in summary_html:
-        summary_html = summary_html.replace("**", "</strong>", 1)
-    summary_html = summary_html.replace("\n\n", "</p><p>").replace("\n", "<br>")
-
-    # --- Score banner (table) ---
+    # --- Overall score banner ---
     score = scoring["score"]
-    label = scoring["label"]
     css = scoring["css"]
-    sep = "; " if lang == "en" else "；"
-    reasons_html = sep.join(scoring["reasons"]) if scoring["reasons"] else ("limited data" if lang == "en" else "数据有限")
+    score_cell = f'{score}<span class="score-den">/10</span>' if score is not None else "—"
     score_table = f"""
   <table class="score-table sc-{css}">
     <tr>
-      <td class="score-num-cell">{score}<span class="score-den">/10</span></td>
-      <td class="score-label-cell">{label}</td>
-      <td class="score-reason-cell">{reasons_html}</td>
+      <td class="score-num-cell">{score_cell}</td>
+      <td class="score-label-cell">{scoring['label']}</td>
+      <td class="score-reason-cell">{t['overall_score']}</td>
     </tr>
   </table>"""
 
-    # --- Dashboard stat tiles ---
-    target = stock.get("target_mean_price")
-    upside = scoring["upside"]
+    # --- Score breakdown (five explained categories) ---
+    bd_rows = ""
+    for c in scoring["categories"]:
+        sc = c["score"]
+        box = f'{sc}/10' if sc is not None else dua
+        bd_rows += (
+            f'<div class="bd-row"><div class="bd-name">{c["name"]}</div>'
+            f'<div class="bd-score {c["css"]}">{box}</div>'
+            f'<div class="bd-exp">{c["explain"]}</div></div>'
+        )
+    breakdown_html = f'<h4 style="margin:14px 0 4px">{t["score_breakdown"]}</h4><div class="breakdown">{bd_rows}</div>'
 
-    def tile(label, value, cls="", hero=False):
+    # --- Enhanced price card + stat tiles ---
+    def tile(label, value, cls="", hero=False, extra=""):
         vc = f" {cls}" if cls else ""
         hc = " hero" if hero else ""
-        return f'<div class="stat{hc}"><div class="s-label">{label}</div><div class="s-value{vc}">{value}</div></div>'
+        return f'<div class="stat{hc}"><div class="s-label">{label}</div><div class="s-value{vc}">{value}</div>{extra}</div>'
 
-    tiles = [tile(t["price"], f"{cur} {num(stock['price'])}", hero=True)]
+    # daily change chip inside the price hero tile
+    dc, dcp = stock.get("day_change"), stock.get("day_change_pct")
+    if dc is not None and dcp is not None:
+        ccls = "up" if dc >= 0 else "down"
+        chip = f'<div class="change-chip {ccls}" style="color:{"#7ef7a8" if dc>=0 else "#fca5a5"}">{dc:+,.2f} ({dcp:+.2f}%)</div>'
+    else:
+        chip = ""
+    # pre/after-hours line
+    ext = ""
+    ms = (stock.get("market_state") or "").upper()
+    if stock.get("pre_market_price") is not None and ms.startswith("PRE"):
+        ext = f'<div class="change-chip" style="color:#c7d6e8;font-weight:600;font-size:12px">{t["premarket"]}: {cur} {stock["pre_market_price"]:,.2f}</div>'
+    elif stock.get("post_market_price") is not None and ("POST" in ms or "CLOSED" in ms):
+        ext = f'<div class="change-chip" style="color:#c7d6e8;font-weight:600;font-size:12px">{t["afterhours"]}: {cur} {stock["post_market_price"]:,.2f}</div>'
+
+    target = stock.get("target_mean_price")
+    upside = scoring["upside"]
+    tiles = [tile(t["price"], money(stock["price"]), hero=True, extra=chip + ext)]
     if target and upside is not None:
-        tiles.append(tile(t["target"], f"{cur} {num(target)}"))
+        tiles.append(tile(t["target"], money(target)))
         tiles.append(tile(t["upside"], f"{upside:+.1f}%", "up" if upside >= 0 else "down"))
     else:
-        tiles.append(tile(t["target"], "N/A"))
-    tiles.append(tile(t["mcap"], f"{cur} {fmt_cap(stock['market_cap'], lang)}"))
+        tiles.append(tile(t["target"], dua))
+    tiles.append(tile(t["mcap"], (dua if stock["market_cap"] is None else f"{cur} {fmt_cap(stock['market_cap'], lang)}")))
     tiles.append(tile(t["pe"], num(stock["pe_ratio"])))
-    tiles.append(tile(t["high52"], f"{cur} {num(stock['week_52_high'])}"))
-    tiles.append(tile(t["low52"], f"{cur} {num(stock['week_52_low'])}"))
-    tiles.append(tile(t["sector"], stock["sector"] or "N/A"))
+    tiles.append(tile(t["high52"], money(stock["week_52_high"])))
+    tiles.append(tile(t["low52"], money(stock["week_52_low"])))
+    tiles.append(tile(t["sector"], stock["sector"] or dua))
     stats_html = f'<div class="stats">{"".join(tiles)}</div>'
+
+    # --- Analyst target detail ---
+    tt = [
+        tile(t["t_mean"], money(stock.get("target_mean_price"))),
+        tile(t["t_median"], money(stock.get("target_median_price"))),
+        tile(t["t_high"], money(stock.get("target_high_price"))),
+        tile(t["t_low"], money(stock.get("target_low_price"))),
+        tile(t["t_count"], (dua if stock.get("target_count") is None else str(stock["target_count"]))),
+    ]
+    if upside is not None:
+        tt.append(tile(t["t_upside"], f"{upside:+.1f}%", "up" if upside >= 0 else "down"))
+    any_target = any(stock.get(k) is not None for k in ("target_mean_price", "target_median_price", "target_high_price", "target_low_price"))
+    if any_target:
+        target_html = f'<h3 class="sec" id="valuation">{t["target_title"]}</h3><div class="stats">{"".join(tt)}</div>'
+    else:
+        target_html = f'<h3 class="sec" id="valuation">{t["target_title"]}</h3><p class="meta-line">{dua}</p>'
+
+    # --- Structured summary (bullish / risk / monitor) ---
+    def fbox(cls, title, items):
+        if items:
+            lis = "".join(f"<li>{x}</li>" for x in items)
+            inner = f"<ul>{lis}</ul>"
+        else:
+            inner = f'<div class="none">{t["none_found"]}</div>'
+        return f'<div class="fbox {cls}"><h4>{title}</h4>{inner}</div>'
+
+    overview_html = f'<p class="meta-line" style="font-size:14px;color:var(--text)">{ssum["overview"]}</p>'
+    factors_html = (
+        f'<div class="factors">'
+        f'{fbox("bull", t["bullish_f"], ssum["bullish"])}'
+        f'{fbox("risk", t["risk_f"], ssum["risks"])}'
+        f'{fbox("mon", t["monitor_f"], ssum["monitor"])}'
+        f'</div>'
+    )
+
+    # --- Market status badge + data source line ---
+    ms_map = {"REGULAR": ("open", t["mkt_regular"]), "PRE": ("ext", t["mkt_pre"]),
+              "POST": ("ext", t["mkt_post"]), "POSTPOST": ("ext", t["mkt_post"]),
+              "CLOSED": ("closed", t["mkt_closed"])}
+    badge = ""
+    for key, (bcls, blabel) in ms_map.items():
+        if ms == key:
+            badge = f'<span class="status-badge {bcls}">{blabel}</span>'
+            break
+    meta_line = f'<p class="meta-line">{t["source"]}: {stock.get("data_source", "—")} · {t["updated"]}: {stock.get("fetched_at", "—")}</p>'
 
     # --- Earnings analysis ---
     earnings_html = ""
@@ -1418,14 +1732,14 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
         q = earnings.get("quarter") or ""
         q_label = (f" ({t['latest_q']} {q})" if lang == "en" else f"（{t['latest_q']} {q}）") if q else ""
         earnings_html = f"""
-  <h3>{t['earnings']}{q_label}</h3>
+  <h3 class="sec" id="earnings">{t['earnings']}{q_label}</h3>
   <table>
     {''.join(e_rows)}
   </table>
   {hist_html}
   <p>{earnings_summary}</p>"""
     else:
-        earnings_html = f"<h3>{t['earnings']}</h3><p>{t['no_earnings']}</p>"
+        earnings_html = f'<h3 class="sec" id="earnings">{t["earnings"]}</h3><p class="meta-line">{t["no_earnings"]}</p>'
 
     # --- Interactive Plotly price chart (1M / 3M / 1Y / 5Y) ---
     if history and history.get("dates"):
@@ -1433,22 +1747,42 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
         chart_js = chart_js.replace("__DATES__", json.dumps(history["dates"]))
         chart_js = chart_js.replace("__CLOSES__", json.dumps(history["closes"]))
         chart_js = chart_js.replace("__PREFIX__", json.dumps(cur + " "))
-        chart_html = f'<h3>{t["chart"]}</h3><div id="priceChart" style="width:100%;height:380px;"></div>{chart_js}'
+        chart_html = f'<h3 class="sec" id="chart">{t["chart"]}</h3><div id="priceChart" style="width:100%;height:380px;"></div>{chart_js}'
     else:
-        chart_html = f'<h3>{t["chart"]}</h3><p>{t["no_chart"]}</p>'
+        chart_html = f'<h3 class="sec" id="chart">{t["chart"]}</h3><p class="meta-line">{t["no_chart"]}</p>'
+
+    # --- Sticky section nav ---
+    secnav = (
+        f'<nav class="secnav">'
+        f'<a href="#overview">{t["nav_overview"]}</a>'
+        f'<a href="#chart">{t["nav_chart"]}</a>'
+        f'<a href="#earnings">{t["nav_earn"]}</a>'
+        f'<a href="#news">{t["nav_news"]}</a>'
+        f'<a href="#valuation">{t["nav_val"]}</a>'
+        f'<a href="#risks">{t["nav_risk"]}</a>'
+        f'</nav>'
+    )
 
     body = f"""
 <div class="card">
   {score_table}
-  <h2>{stock['ticker']} — {stock['company'] or t['na_company']}</h2>
-  {stats_html}
+  <h2>{stock['ticker']} — {stock['company'] or t['na_company']}{badge}</h2>
+  {meta_line}
+  {secnav}
+  <div class="sec" id="overview">
+    {stats_html}
+    <h3>{t['overview']}</h3>
+    {overview_html}
+  </div>
   {chart_html}
   {earnings_html}
-  <h3>{t['news']}</h3>
+  <h3 class="sec" id="news">{t['news']}</h3>
   <ul>{news_html}</ul>
-  <h3>{t['summary']}</h3>
-  <p>{summary_html}</p>
-  <p><small>{t['saved']} #{report_id}</small></p>
+  {target_html}
+  {breakdown_html}
+  <h3 class="sec" id="risks">{t['summary']}</h3>
+  {factors_html}
+  <p class="meta-line" style="margin-top:14px">{t['saved']} #{report_id}</p>
 </div>"""
     return page(body, ticker, lang)
 
