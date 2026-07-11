@@ -2,6 +2,9 @@
 
 import json
 import math
+import os
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -115,8 +118,55 @@ def _yf_session():
         return None
 
 
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+
+def _finnhub_get(path: str, params: dict) -> dict | None:
+    """Call a Finnhub REST endpoint; returns parsed JSON or None."""
+    if not FINNHUB_KEY:
+        return None
+    query = urllib.parse.urlencode({**params, "token": FINNHUB_KEY})
+    url = f"https://finnhub.io/api/v1{path}?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def fetch_finnhub_meta(symbol: str) -> dict:
+    """Company profile + key metrics from Finnhub.
+
+    Used to fill the gaps Yahoo's heavier endpoints leave when its
+    quoteSummary API is rate-limited on shared cloud IPs.
+    """
+    out: dict = {}
+
+    prof = _finnhub_get("/stock/profile2", {"symbol": symbol})
+    if prof:
+        out["company"] = prof.get("name")
+        out["sector"] = prof.get("finnhubIndustry")
+        out["currency"] = prof.get("currency")
+        mc = prof.get("marketCapitalization")  # reported in millions
+        if mc:
+            out["market_cap"] = float(mc) * 1e6
+
+    metric = _finnhub_get("/stock/metric", {"symbol": symbol, "metric": "all"})
+    if metric and isinstance(metric.get("metric"), dict):
+        m = metric["metric"]
+        out["pe_ratio"] = _safe_float(m.get("peTTM") or m.get("peBasicExclExtraTTM"))
+        out["week_52_high"] = _safe_float(m.get("52WeekHigh"))
+        out["week_52_low"] = _safe_float(m.get("52WeekLow"))
+
+    quote = _finnhub_get("/quote", {"symbol": symbol})
+    if quote and quote.get("c"):
+        out["price"] = _safe_float(quote.get("c"))
+
+    return out
+
+
 def fetch_stock_data(ticker: str) -> dict:
-    """Pull price, info and news from Yahoo Finance."""
+    """Pull price, info and news from Yahoo Finance (Finnhub fills the gaps)."""
     symbol = ticker.upper()
 
     if symbol == "DEMO":
@@ -188,6 +238,21 @@ def fetch_stock_data(ticker: str) -> dict:
                 published=pub_date,
             )
         )
+
+    # Fill any gaps Yahoo left (common when its quoteSummary API is rate-limited
+    # on shared cloud IPs) using Finnhub, if an API key is configured.
+    if FINNHUB_KEY and (company is None or pe_ratio is None or sector is None or price is None):
+        fh = fetch_finnhub_meta(symbol)
+        company = company or fh.get("company")
+        sector = sector or fh.get("sector")
+        currency = currency or fh.get("currency") or "USD"
+        market_cap = market_cap or fh.get("market_cap")
+        if pe_ratio is None:
+            pe_ratio = fh.get("pe_ratio")
+        week_52_high = week_52_high or fh.get("week_52_high")
+        week_52_low = week_52_low or fh.get("week_52_low")
+        if price is None:
+            price = fh.get("price")
 
     return {
         "ticker": symbol,

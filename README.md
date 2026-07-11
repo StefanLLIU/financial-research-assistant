@@ -42,6 +42,17 @@ uvicorn main:app --reload
 
 在输入框输入股票代码（如 `NVDA`、`AAPL`、`TSLA`），或点击右侧板块中的任意股票。想快速体验可以先输入 **`DEMO`**。
 
+### 可选：配置 Finnhub（推荐用于云部署）
+
+yfinance 在共享云 IP 上会被雅虎限流，导致公司名、市盈率、行业等字段间歇性缺失。配置一个免费的 [Finnhub](https://finnhub.io) API key 可以补上这些字段：
+
+```bash
+export FINNHUB_API_KEY=你的key   # 本地
+# 云端（Render）：在 Environment 里加环境变量 FINNHUB_API_KEY
+```
+
+不配置也能运行，只是云端真实股票的详细信息可能显示 N/A。
+
 ---
 
 ## 🛠️ 技术栈 · Tech Stack
