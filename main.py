@@ -3,15 +3,22 @@
 import json
 import math
 from datetime import datetime
+from pathlib import Path
 
 import yfinance as yf
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import database as db
 
 app = FastAPI(title="AI Financial Research Assistant", version="1.0.0")
+
+# Serve PWA icons (and any other static assets)
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +776,7 @@ STOCK_CATEGORIES = [
 T = {
     "zh": {
         "title": "📈 股票研究助手",
+        "app_name": "股票研究",
         "subtitle": "输入股票代码，或从右侧板块中选择，获取实时价格、财报分析、目标价与投资评分。",
         "placeholder": "例如 NVDA、AAPL、TSLA、DEMO",
         "analyze": "分析",
@@ -790,6 +798,7 @@ T = {
     },
     "en": {
         "title": "📈 Stock Research Assistant",
+        "app_name": "StockResearch",
         "subtitle": "Enter a ticker, or pick from the sectors at right, for live price, earnings analysis, target price and an investment score.",
         "placeholder": "e.g. NVDA, AAPL, TSLA, DEMO",
         "analyze": "Analyze",
@@ -898,7 +907,18 @@ def page(body: str, ticker: str = "", lang: str = "zh") -> str:
     tk_q = f"&ticker={ticker}" if ticker else ""
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
-<head><meta charset="utf-8"><title>{t['title']}</title>{PAGE_CSS}
+<head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{t['title']}</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#1e3a5f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="{t['app_name']}">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/static/icon-192.png">
+{PAGE_CSS}
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script></head>
 <body>
 <div class="layout">
@@ -917,12 +937,81 @@ def page(body: str, ticker: str = "", lang: str = "zh") -> str:
   </div>
   {sidebar_html(lang)}
 </div>
+<script>
+if ('serviceWorker' in navigator) {{
+  window.addEventListener('load', function(){{
+    navigator.serviceWorker.register('/sw.js').catch(function(){{}});
+  }});
+}}
+</script>
 </body>
 </html>"""
 
 
 def _norm_lang(lang: str) -> str:
     return "en" if (lang or "").lower().startswith("en") else "zh"
+
+
+# --- PWA: manifest, service worker, offline ---
+_MANIFEST = {
+    "name": "股票研究助手 · Financial Research Assistant",
+    "short_name": "股票研究",
+    "description": "实时行情、财报分析、投资评分 · Live stock research & scoring",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#f9fafb",
+    "theme_color": "#1e3a5f",
+    "icons": [
+        {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+        {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+    ],
+}
+
+_SERVICE_WORKER = """
+const CACHE = 'fra-v1';
+const SHELL = ['/', '/static/icon-192.png', '/static/apple-touch-icon.png'];
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(()=>{}));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((keys) =>
+    Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))));
+  self.clients.claim();
+});
+
+// Network-first for pages (fresh data); cache-first for static icons.
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET') return;
+  if (url.pathname.startsWith('/static/')) {
+    e.respondWith(caches.match(e.request).then((r) => r || fetch(e.request)));
+    return;
+  }
+  e.respondWith(
+    fetch(e.request).catch(() => caches.match(e.request).then((r) => r || caches.match('/')))
+  );
+});
+"""
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return JSONResponse(_MANIFEST, media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+def service_worker():
+    # Served from root so its scope covers the whole site.
+    return PlainTextResponse(
+        _SERVICE_WORKER,
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
