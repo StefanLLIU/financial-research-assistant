@@ -816,6 +816,22 @@ PAGE_CSS = """
   .score-den{font-size:18px;font-weight:500;opacity:.85;}
   .lang-btn{background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:6px 12px;font-size:14px;text-decoration:none;color:#1e3a5f;white-space:nowrap;}
   .lang-btn:hover{background:#1e3a5f;color:#fff;}
+  /* Dashboard stat tiles */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:14px 0 6px;}
+  .stat{background:#f8fafc;border:1px solid #eef2f7;border-radius:12px;padding:14px 16px;}
+  .stat .s-label{font-size:12px;color:#64748b;margin-bottom:5px;}
+  .stat .s-value{font-size:21px;font-weight:700;color:#1e3a5f;line-height:1.2;word-break:break-word;}
+  .stat .s-value.up{color:#166534;}
+  .stat .s-value.down{color:#991b1b;}
+  .stat.hero{background:linear-gradient(135deg,#1e3a5f,#2d5480);border:none;}
+  .stat.hero .s-label{color:#c7d6e8;}
+  .stat.hero .s-value{color:#fff;font-size:24px;}
+  /* Loading overlay */
+  .loading-overlay{position:fixed;inset:0;background:rgba(249,250,251,.9);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;flex-direction:column;z-index:9999;}
+  .loading-overlay.show{display:flex;}
+  .spinner{width:46px;height:46px;border:4px solid #dbe3ec;border-top-color:#1e3a5f;border-radius:50%;animation:spin .8s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .loading-text{margin-top:16px;color:#1e3a5f;font-weight:600;font-size:15px;}
 </style>
 """
 
@@ -857,6 +873,7 @@ T = {
         "q": "季度", "no_earnings": "暂无财报数据。",
         "news": "📰 最新新闻", "no_news": "暂无新闻。",
         "summary": "📋 投资摘要", "saved": "报告已保存 — 编号",
+        "loading": "分析中，请稍候…",
         "err_empty": "请输入股票代码。",
         "err_fetch": "获取数据出错：",
         "err_noprice": "未找到「{t}」的价格数据，请检查代码是否正确。",
@@ -879,6 +896,7 @@ T = {
         "q": "Quarter", "no_earnings": "No earnings data available.",
         "news": "📰 Latest News", "no_news": "No recent news.",
         "summary": "📋 Investment Summary", "saved": "Report saved — ID",
+        "loading": "Analyzing, please wait…",
         "err_empty": "Please enter a ticker.",
         "err_fetch": "Error fetching data: ",
         "err_noprice": 'No price data found for "{t}". Check the symbol.',
@@ -1002,7 +1020,20 @@ def page(body: str, ticker: str = "", lang: str = "zh") -> str:
   </div>
   {sidebar_html(lang)}
 </div>
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="spinner"></div>
+  <div class="loading-text">{t['loading']}</div>
+</div>
 <script>
+(function(){{
+  var ov = document.getElementById('loadingOverlay');
+  function showLoading(){{ if(ov) ov.classList.add('show'); }}
+  // 提交表单、点击板块股票或语言切换时，显示加载动画
+  document.querySelectorAll('form').forEach(function(f){{ f.addEventListener('submit', showLoading); }});
+  document.querySelectorAll('a.tk, a.lang-btn').forEach(function(a){{ a.addEventListener('click', showLoading); }});
+  // 从缓存/后退返回时隐藏
+  window.addEventListener('pageshow', function(){{ if(ov) ov.classList.remove('show'); }});
+}})();
 if ('serviceWorker' in navigator) {{
   window.addEventListener('load', function(){{
     navigator.serviceWorker.register('/sw.js').catch(function(){{}});
@@ -1151,17 +1182,27 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
     </tr>
   </table>"""
 
-    # --- Analyst target rows ---
+    # --- Dashboard stat tiles ---
     target = stock.get("target_mean_price")
     upside = scoring["upside"]
+
+    def tile(label, value, cls="", hero=False):
+        vc = f" {cls}" if cls else ""
+        hc = " hero" if hero else ""
+        return f'<div class="stat{hc}"><div class="s-label">{label}</div><div class="s-value{vc}">{value}</div></div>'
+
+    tiles = [tile(t["price"], f"{cur} {num(stock['price'])}", hero=True)]
     if target and upside is not None:
-        up_class = "up" if upside >= 0 else "down"
-        target_rows = (
-            f'<tr><th>{t["target"]}</th><td>{cur} {num(target)}</td></tr>'
-            f'<tr><th>{t["upside"]}</th><td class="{up_class}">{upside:+.1f}%</td></tr>'
-        )
+        tiles.append(tile(t["target"], f"{cur} {num(target)}"))
+        tiles.append(tile(t["upside"], f"{upside:+.1f}%", "up" if upside >= 0 else "down"))
     else:
-        target_rows = f'<tr><th>{t["target"]}</th><td>N/A</td></tr>'
+        tiles.append(tile(t["target"], "N/A"))
+    tiles.append(tile(t["mcap"], f"{cur} {fmt_cap(stock['market_cap'], lang)}"))
+    tiles.append(tile(t["pe"], num(stock["pe_ratio"])))
+    tiles.append(tile(t["high52"], f"{cur} {num(stock['week_52_high'])}"))
+    tiles.append(tile(t["low52"], f"{cur} {num(stock['week_52_low'])}"))
+    tiles.append(tile(t["sector"], stock["sector"] or "N/A"))
+    stats_html = f'<div class="stats">{"".join(tiles)}</div>'
 
     # --- Earnings analysis ---
     earnings_html = ""
@@ -1245,15 +1286,7 @@ def research_page(ticker: str = Form(""), lang: str = Form("zh")):
 <div class="card">
   {score_table}
   <h2>{stock['ticker']} — {stock['company'] or t['na_company']}</h2>
-  <table>
-    <tr><th>{t['price']}</th><td>{cur} {num(stock['price'])}</td></tr>
-    {target_rows}
-    <tr><th>{t['mcap']}</th><td>{cur} {fmt_cap(stock['market_cap'], lang)}</td></tr>
-    <tr><th>{t['pe']}</th><td>{num(stock['pe_ratio'])}</td></tr>
-    <tr><th>{t['high52']}</th><td>{cur} {num(stock['week_52_high'])}</td></tr>
-    <tr><th>{t['low52']}</th><td>{cur} {num(stock['week_52_low'])}</td></tr>
-    <tr><th>{t['sector']}</th><td>{stock['sector'] or 'N/A'}</td></tr>
-  </table>
+  {stats_html}
   {chart_html}
   {earnings_html}
   <h3>{t['news']}</h3>
